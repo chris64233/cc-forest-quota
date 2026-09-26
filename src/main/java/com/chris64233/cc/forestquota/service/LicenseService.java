@@ -6,10 +6,13 @@ import com.chris64233.cc.forestquota.domain.HarvestLicense;
 import com.chris64233.cc.forestquota.domain.HarvestSeason;
 import com.chris64233.cc.forestquota.domain.LicenseItem;
 import com.chris64233.cc.forestquota.domain.LicenseStatus;
+import com.chris64233.cc.forestquota.domain.LicenseStatusEvent;
 import com.chris64233.cc.forestquota.domain.SeasonQuota;
+import com.chris64233.cc.forestquota.domain.StatusEventType;
 import com.chris64233.cc.forestquota.repository.AuditEventRepository;
 import com.chris64233.cc.forestquota.repository.HarvestLicenseRepository;
 import com.chris64233.cc.forestquota.repository.HarvestSeasonRepository;
+import com.chris64233.cc.forestquota.repository.LicenseStatusEventRepository;
 import com.chris64233.cc.forestquota.repository.SeasonQuotaRepository;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
@@ -19,11 +22,14 @@ import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
@@ -37,6 +43,7 @@ public class LicenseService {
     private final HarvestSeasonRepository seasonRepository;
     private final SeasonQuotaRepository quotaRepository;
     private final AuditEventRepository auditEventRepository;
+    private final LicenseStatusEventRepository statusEventRepository;
     private final TransactionTemplate transactionTemplate;
     private final TransactionTemplate readOnlyTemplate;
 
@@ -44,11 +51,13 @@ public class LicenseService {
                           HarvestSeasonRepository seasonRepository,
                           SeasonQuotaRepository quotaRepository,
                           AuditEventRepository auditEventRepository,
+                          LicenseStatusEventRepository statusEventRepository,
                           PlatformTransactionManager transactionManager) {
         this.licenseRepository = licenseRepository;
         this.seasonRepository = seasonRepository;
         this.quotaRepository = quotaRepository;
         this.auditEventRepository = auditEventRepository;
+        this.statusEventRepository = statusEventRepository;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
         this.readOnlyTemplate = new TransactionTemplate(transactionManager);
         this.readOnlyTemplate.setReadOnly(true);
@@ -70,6 +79,41 @@ public class LicenseService {
         List<SpeciesVolume> normalized = normalizeSettlement(items);
         String settlementHash = settlementHash(normalized);
         return transactionTemplate.execute(status -> doSettle(applicationNo, normalized, settlementHash));
+    }
+
+    public LicenseView suspend(String applicationNo, StatusChangeCommand command) {
+        StatusChangeCommand normalized = normalizeStatusChange(command, StatusEventType.SUSPENDED);
+        return transactionTemplate.execute(status -> doChangeStatus(applicationNo, normalized, StatusEventType.SUSPENDED));
+    }
+
+    public LicenseView resume(String applicationNo, StatusChangeCommand command) {
+        StatusChangeCommand normalized = normalizeStatusChange(command, StatusEventType.RESUMED);
+        return transactionTemplate.execute(status -> doChangeStatus(applicationNo, normalized, StatusEventType.RESUMED));
+    }
+
+    public LicenseView revoke(String applicationNo, StatusChangeCommand command) {
+        StatusChangeCommand normalized = normalizeStatusChange(command, StatusEventType.REVOKED);
+        return transactionTemplate.execute(status -> doChangeStatus(applicationNo, normalized, StatusEventType.REVOKED));
+    }
+
+    public List<StatusEventView> getTimeline(String applicationNo) {
+        return readOnlyTemplate.execute(status -> {
+            HarvestLicense license = licenseRepository.findByApplicationNo(applicationNo)
+                    .orElseThrow(() -> new NotFoundException("许可证不存在: " + applicationNo));
+            return statusEventRepository.findByLicenseIdOrderByEffectiveAtAscIdAsc(license.getId()).stream()
+                    .map(StatusEventView::of)
+                    .toList();
+        });
+    }
+
+    public ResumeCheckView getResumeCheck(String applicationNo) {
+        return readOnlyTemplate.execute(status -> {
+            HarvestLicense license = licenseRepository.findByApplicationNo(applicationNo)
+                    .orElseThrow(() -> new NotFoundException("许可证不存在: " + applicationNo));
+            List<String> blockers = resumeBlockers(license);
+            return new ResumeCheckView(license.getApplicationNo(), license.getStatus(),
+                    blockers.isEmpty(), blockers);
+        });
     }
 
     public LicenseView getLicense(String applicationNo) {
@@ -146,6 +190,12 @@ public class LicenseService {
             }
             throw new ConflictException("许可证已核销，申报内容与原核销记录不一致");
         }
+        if (license.getStatus() == LicenseStatus.SUSPENDED) {
+            throw new ConflictException("许可证已暂停，暂停期间不能新增实采申报");
+        }
+        if (license.getStatus() == LicenseStatus.REVOKED) {
+            throw new ConflictException("许可证已撤销，不能申报实采");
+        }
         Map<String, BigDecimal> actuals = new TreeMap<>();
         for (SpeciesVolume item : items) {
             actuals.put(item.species(), item.volume());
@@ -184,6 +234,147 @@ public class LicenseService {
         auditEventRepository.save(new AuditEvent(license, seasonId, AuditEventType.SETTLED, null,
                 "核销实采: " + describe(actuals), now));
         return LicenseView.of(license);
+    }
+
+    private LicenseView doChangeStatus(String applicationNo, StatusChangeCommand command, StatusEventType type) {
+        HarvestLicense license = licenseRepository.findByApplicationNoForUpdate(applicationNo)
+                .orElseThrow(() -> new NotFoundException("许可证不存在: " + applicationNo));
+        Optional<LicenseStatusEvent> existing =
+                statusEventRepository.findByLicenseIdAndEventNo(license.getId(), command.eventNo());
+        if (existing.isPresent()) {
+            LicenseStatusEvent event = existing.get();
+            if (event.getEventType() == type
+                    && event.getEffectiveAt().equals(command.effectiveAt())
+                    && Objects.equals(event.getReason(), command.reason())) {
+                return LicenseView.of(license);
+            }
+            throw new ConflictException("事件号 " + command.eventNo() + " 已存在且事件内容不一致");
+        }
+        statusEventRepository.findFirstByLicenseIdOrderByEffectiveAtDescIdDesc(license.getId())
+                .ifPresent(latest -> {
+                    if (command.effectiveAt().isBefore(latest.getEffectiveAt())) {
+                        throw new BusinessValidationException("状态事件生效时间不能早于上一事件生效时间 "
+                                + latest.getEffectiveAt());
+                    }
+                });
+        Long seasonId = license.getSeason().getId();
+        Instant now = Instant.now();
+        switch (type) {
+            case SUSPENDED -> {
+                requireStatus(license, LicenseStatus.APPROVED, "暂停");
+                license.markSuspended();
+            }
+            case RESUMED -> {
+                requireStatus(license, LicenseStatus.SUSPENDED, "恢复");
+                List<String> blockers = resumeBlockers(license);
+                if (!blockers.isEmpty()) {
+                    throw new BusinessValidationException("恢复被阻止: " + String.join("; ", blockers));
+                }
+                license.markResumed();
+            }
+            case REVOKED -> {
+                if (license.getStatus() != LicenseStatus.APPROVED
+                        && license.getStatus() != LicenseStatus.SUSPENDED) {
+                    throw new ConflictException("许可证当前状态为 " + license.getStatus() + "，不能撤销");
+                }
+                releaseAllRemaining(license, seasonId, now);
+                license.markRevoked();
+            }
+        }
+        statusEventRepository.save(new LicenseStatusEvent(license, command.eventNo(), type,
+                command.reason(), command.effectiveAt(), now));
+        auditEventRepository.save(new AuditEvent(license, seasonId, AuditEventType.valueOf(type.name()), null,
+                statusChangeDetails(type, command), now));
+        return LicenseView.of(license);
+    }
+
+    private void requireStatus(HarvestLicense license, LicenseStatus expected, String action) {
+        if (license.getStatus() != expected) {
+            throw new ConflictException("许可证当前状态为 " + license.getStatus() + "，不能" + action);
+        }
+    }
+
+    private void releaseAllRemaining(HarvestLicense license, Long seasonId, Instant now) {
+        List<LicenseItem> items = license.getItems().stream()
+                .sorted(Comparator.comparing(LicenseItem::getSpecies))
+                .toList();
+        for (LicenseItem item : items) {
+            item.releaseRemaining();
+            if (item.getReleasedVolume().signum() > 0) {
+                SeasonQuota quota = quotaRepository
+                        .findBySeasonIdAndSpeciesForUpdate(seasonId, item.getSpecies())
+                        .orElseThrow(() -> new IllegalStateException("额度台账缺失: " + item.getSpecies()));
+                quota.release(item.getReleasedVolume());
+                auditEventRepository.save(new AuditEvent(license, seasonId, AuditEventType.RELEASED,
+                        item.getSpecies(), "撤销释放未实采占用: " + item.getReleasedVolume().toPlainString(), now));
+            }
+        }
+    }
+
+    private List<String> resumeBlockers(HarvestLicense license) {
+        List<String> blockers = new ArrayList<>();
+        if (license.getStatus() != LicenseStatus.SUSPENDED) {
+            blockers.add("许可证当前状态为 " + license.getStatus() + "，仅暂停状态可恢复");
+            return blockers;
+        }
+        HarvestSeason season = license.getSeason();
+        if (license.getWorkStartDate().isBefore(season.getStartDate())
+                || license.getWorkEndDate().isAfter(season.getEndDate())) {
+            blockers.add("作业日期区间不再落在许可季 " + season.getStartDate() + " 至 " + season.getEndDate() + " 内");
+        }
+        if (license.getWorkEndDate().isBefore(LocalDate.now())) {
+            blockers.add("许可证作业期限已于 " + license.getWorkEndDate() + " 届满");
+        }
+        List<LicenseItem> items = license.getItems().stream()
+                .sorted(Comparator.comparing(LicenseItem::getSpecies))
+                .toList();
+        for (LicenseItem item : items) {
+            Optional<SeasonQuota> quotaOpt =
+                    quotaRepository.findBySeasonIdAndSpecies(season.getId(), item.getSpecies());
+            if (quotaOpt.isEmpty()) {
+                blockers.add("树种额度台账缺失: " + item.getSpecies());
+                continue;
+            }
+            SeasonQuota quota = quotaOpt.get();
+            BigDecimal outstanding = item.getApprovedVolume()
+                    .subtract(item.getActualVolume() == null ? BigDecimal.ZERO : item.getActualVolume());
+            if (quota.getOccupiedVolume().compareTo(outstanding) < 0) {
+                blockers.add("树种 " + item.getSpecies() + " 台账占用 "
+                        + quota.getOccupiedVolume().toPlainString()
+                        + " 低于许可证未实采占用 " + outstanding.toPlainString());
+            }
+            if (quota.available().signum() < 0) {
+                blockers.add("树种 " + item.getSpecies() + " 额度已超限，可用 "
+                        + quota.available().toPlainString());
+            }
+        }
+        return blockers;
+    }
+
+    private StatusChangeCommand normalizeStatusChange(StatusChangeCommand command, StatusEventType type) {
+        if (command == null) {
+            throw new BusinessValidationException("状态变更内容不能为空");
+        }
+        if (!StringUtils.hasText(command.eventNo())) {
+            throw new BusinessValidationException("事件号不能为空");
+        }
+        if (command.effectiveAt() == null) {
+            throw new BusinessValidationException("生效时间不能为空");
+        }
+        String reason = StringUtils.hasText(command.reason()) ? command.reason().trim() : null;
+        if (type == StatusEventType.SUSPENDED && reason == null) {
+            throw new BusinessValidationException("暂停原因不能为空");
+        }
+        return new StatusChangeCommand(command.eventNo().trim(), reason, command.effectiveAt());
+    }
+
+    private String statusChangeDetails(StatusEventType type, StatusChangeCommand command) {
+        String action = switch (type) {
+            case SUSPENDED -> "暂停许可证";
+            case RESUMED -> "恢复许可证";
+            case REVOKED -> "撤销许可证，释放全部未实采占用";
+        };
+        return command.reason() == null ? action : action + "，原因: " + command.reason();
     }
 
     private LicenseView resolveAfterConcurrentInsert(ApproveCommand command) {

@@ -87,6 +87,18 @@ public class HarvestLicense {
         this.settledAt = settledAt;
     }
 
+    public void markSuspended() {
+        this.status = LicenseStatus.SUSPENDED;
+    }
+
+    public void markResumed() {
+        this.status = LicenseStatus.APPROVED;
+    }
+
+    public void markRevoked() {
+        this.status = LicenseStatus.REVOKED;
+    }
+
     public Long getId() {
         return id;
     }

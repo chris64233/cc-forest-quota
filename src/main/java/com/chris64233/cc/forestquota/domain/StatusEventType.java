@@ -1,8 +1,7 @@
 package com.chris64233.cc.forestquota.domain;
 
-public enum LicenseStatus {
-    APPROVED,
+public enum StatusEventType {
     SUSPENDED,
-    SETTLED,
+    RESUMED,
     REVOKED
 }
