@@ -19,5 +19,7 @@ public interface SeasonQuotaRepository extends JpaRepository<SeasonQuota, Long> 
 
     List<SeasonQuota> findBySeasonIdOrderBySpeciesAsc(Long seasonId);
 
+    Optional<SeasonQuota> findBySeasonIdAndSpecies(Long seasonId, String species);
+
     boolean existsBySeasonIdAndSpecies(Long seasonId, String species);
 }

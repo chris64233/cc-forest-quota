@@ -2,5 +2,7 @@ package com.chris64233.cc.forestquota.domain;
 
 public enum LicenseStatus {
     APPROVED,
-    SETTLED
+    SUSPENDED,
+    SETTLED,
+    REVOKED
 }

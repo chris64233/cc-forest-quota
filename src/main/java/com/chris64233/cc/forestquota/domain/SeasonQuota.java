@@ -67,6 +67,10 @@ public class SeasonQuota {
         this.harvestedVolume = this.harvestedVolume.add(actual);
     }
 
+    public void release(BigDecimal amount) {
+        this.occupiedVolume = this.occupiedVolume.subtract(amount);
+    }
+
     public Long getId() {
         return id;
     }

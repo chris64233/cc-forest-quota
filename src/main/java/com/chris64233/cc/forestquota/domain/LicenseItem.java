@@ -57,6 +57,17 @@ public class LicenseItem {
         this.releasedVolume = this.approvedVolume.subtract(actualVolume);
     }
 
+    public BigDecimal remainingVolume() {
+        BigDecimal actual = actualVolume == null ? BigDecimal.ZERO : actualVolume;
+        BigDecimal released = releasedVolume == null ? BigDecimal.ZERO : releasedVolume;
+        return approvedVolume.subtract(actual).subtract(released);
+    }
+
+    public void releaseRemaining() {
+        BigDecimal released = releasedVolume == null ? BigDecimal.ZERO : releasedVolume;
+        this.releasedVolume = released.add(remainingVolume());
+    }
+
     void setLicense(HarvestLicense license) {
         this.license = license;
     }
